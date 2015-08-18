@@ -45,7 +45,6 @@ import (
 
 	"git.torproject.org/pluggable-transports/goptlib.git"
 	"git.torproject.org/pluggable-transports/obfs4.git/common/log"
-	"git.torproject.org/pluggable-transports/obfs4.git/common/socks5"
 	"git.torproject.org/pluggable-transports/obfs4.git/transports"
 	"git.torproject.org/pluggable-transports/obfs4.git/transports/base"
 )
@@ -58,6 +57,10 @@ const (
 
 var stateDir string
 var termMon *termMonitor
+
+// DialFn is a function pointer to a function that matches the net.Dialer.Dial
+// interface.
+type DialFn func(string, string) (net.Conn, error)
 
 func clientSetup() (launched bool, listeners []net.Listener) {
 	ptClientInfo, err := pt.ClientSetup(transports.Transports())
@@ -86,14 +89,14 @@ func clientSetup() (launched bool, listeners []net.Listener) {
 			continue
 		}
 
-		ln, err := net.Listen("tcp", socksAddr)
+		ln, err := pt.ListenSocks("tcp", socksAddr)
 		if err != nil {
 			pt.CmethodError(name, err.Error())
 			continue
 		}
 
 		go clientAcceptLoop(f, ln, ptClientProxy)
-		pt.Cmethod(name, socks5.Version(), ln.Addr())
+		pt.Cmethod(name, ln.Version(), ln.Addr())
 
 		log.Infof("%s - registered listener: %s", name, ln.Addr())
 
@@ -105,10 +108,10 @@ func clientSetup() (launched bool, listeners []net.Listener) {
 	return
 }
 
-func clientAcceptLoop(f base.ClientFactory, ln net.Listener, proxyURI *url.URL) error {
+func clientAcceptLoop(f base.ClientFactory, ln *pt.SocksListener, proxyURI *url.URL) error {
 	defer ln.Close()
 	for {
-		conn, err := ln.Accept()
+		conn, err := ln.AcceptSocks()
 		if err != nil {
 			if e, ok := err.(net.Error); ok && !e.Temporary() {
 				return err
@@ -119,46 +122,42 @@ func clientAcceptLoop(f base.ClientFactory, ln net.Listener, proxyURI *url.URL) 
 	}
 }
 
-func clientHandler(f base.ClientFactory, conn net.Conn, proxyURI *url.URL) {
+func clientHandler(f base.ClientFactory, conn *pt.SocksConn, proxyURI *url.URL) {
 	defer conn.Close()
 	termMon.onHandlerStart()
 	defer termMon.onHandlerFinish()
 
 	name := f.Transport().Name()
-
-	// Read the client's SOCKS handshake.
-	socksReq, err := socks5.Handshake(conn)
-	if err != nil {
-		log.Errorf("%s - client failed socks handshake: %s", name, err)
-		return
-	}
-	addrStr := log.ElideAddr(socksReq.Target)
+	addrStr := log.ElideAddr(conn.Req.Target)
+	log.Infof("%s(%s) - new connection", name, addrStr)
 
 	// Deal with arguments.
-	args, err := f.ParseArgs(&socksReq.Args)
+	args, err := f.ParseArgs(&conn.Req.Args)
 	if err != nil {
 		log.Errorf("%s(%s) - invalid arguments: %s", name, addrStr, err)
-		socksReq.Reply(socks5.ReplyGeneralFailure)
+		conn.Reject()
 		return
 	}
 
 	// Obtain the proxy dialer if any, and create the outgoing TCP connection.
-	dialFn := proxy.Direct.Dial
-	if proxyURI != nil {
+	var dialFn DialFn
+	if proxyURI == nil {
+		dialFn = proxy.Direct.Dial
+	} else {
+		// This is unlikely to happen as the proxy protocol is verified during
+		// the configuration phase.
 		dialer, err := proxy.FromURL(proxyURI, proxy.Direct)
 		if err != nil {
-			// This should basically never happen, since config protocol
-			// verifies this.
 			log.Errorf("%s(%s) - failed to obtain proxy dialer: %s", name, addrStr, log.ElideError(err))
-			socksReq.Reply(socks5.ReplyGeneralFailure)
+			conn.Reject()
 			return
 		}
 		dialFn = dialer.Dial
 	}
-	remoteConn, err := dialFn("tcp", socksReq.Target) // XXX: Allow UDP?
+	remoteConn, err := dialFn("tcp", conn.Req.Target) // XXX: Allow UDP?
 	if err != nil {
 		log.Errorf("%s(%s) - outgoing connection failed: %s", name, addrStr, log.ElideError(err))
-		socksReq.Reply(socks5.ErrorToReplyCode(err))
+		conn.Reject()
 		return
 	}
 	defer remoteConn.Close()
@@ -168,12 +167,12 @@ func clientHandler(f base.ClientFactory, conn net.Conn, proxyURI *url.URL) {
 	remote, err := f.WrapConn(remoteConn, args)
 	if err != nil {
 		log.Errorf("%s(%s) - handshake failed: %s", name, addrStr, log.ElideError(err))
-		socksReq.Reply(socks5.ReplyGeneralFailure)
+		conn.Reject()
 		return
 	}
-	err = socksReq.Reply(socks5.ReplySucceeded)
+	err = conn.Grant(remoteConn.RemoteAddr().(*net.TCPAddr))
 	if err != nil {
-		log.Errorf("%s(%s) - SOCKS reply failed: %s", name, addrStr, log.ElideError(err))
+		log.Errorf("%s(%s) - SOCKS grant failed: %s", name, addrStr, log.ElideError(err))
 		return
 	}
 
